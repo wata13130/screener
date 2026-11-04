@@ -1,0 +1,32 @@
+name: screen
+
+on:
+  schedule:
+    - cron: "0 22 * * 0-4"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install yfinance pandas numpy xlrd openpyxl
+      - name: Screen all listed companies
+        run: >
+          python oversold_screener.py --all --workers 4 --top 50
+          --html docs/index.html --out docs/result.csv
+      - name: Publish
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@users.noreply.github.com"
+          git add docs
+          git commit -m "update screening result" || echo "no changes"
+          git push
