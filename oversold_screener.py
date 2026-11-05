@@ -19,6 +19,7 @@
   「下がっている理由」は必ず決算資料・ニュースで確認してください。
 """
 import argparse
+import json
 import random
 import sys
 import time
@@ -55,8 +56,14 @@ def price_metrics(close):
     base = close[close.index.year < year]
     base_price = float(base.iloc[-1]) if len(base) else float(this_year.iloc[0])
     last = float(close.iloc[-1])
+    step = max(1, len(this_year) // 50)  # 推移グラフ用に間引く
+    spark = [round(float(v), 2) for v in this_year.iloc[::step]]
+    if (len(this_year) - 1) % step:
+        spark.append(round(last, 2))
     return {
         "price": last,
+        "base_price": base_price,
+        "spark": json.dumps(spark),
         "ytd_return": last / base_price - 1,
         "from_high": last / float(this_year.max()) - 1,
         "rsi14": rsi(close),
@@ -312,18 +319,184 @@ def apply_filters(d, args):
 
 
 # ---------------------------------------------------------------- HTML出力
+WARN_TEXT = {
+    "大幅減益": "利益が前年から2割超減っています。",
+    "減収": "売上が前年から5%超減っています。",
+    "高負債": "負債が自己資本の1.5倍を超えています。",
+    "低ROE": "ROE(自己資本利益率)が3%未満で、稼ぐ力が弱めです。",
+}
+
+PAGE = r"""<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>売られ過ぎ割安株スクリーニング</title>
+<style>
+body{font-family:-apple-system,sans-serif;margin:0;padding:12px;background:#f4f5f7;color:#222}
+h1{font-size:18px;margin:4px 0} .meta{font-size:12px;color:#666;margin-bottom:10px;line-height:1.5}
+.card{background:#fff;border-radius:10px;padding:10px 12px;margin-bottom:8px;box-shadow:0 1px 2px #0002;cursor:pointer}
+.card:active{background:#eef3fb}
+.head{display:flex;gap:8px;align-items:center;font-size:15px}
+.nm{flex:1;color:#0b5cd5;font-weight:600}
+.rank{background:#222;color:#fff;border-radius:50%;min-width:22px;height:22px;text-align:center;font-size:12px;line-height:22px}
+.score{font-weight:700;color:#0a7d33} .sec{font-size:12px;color:#777;margin:2px 0 6px 30px}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;font-size:12px;color:#555}
+.grid b{display:block;font-size:14px;color:#111}
+.warn{margin-top:6px;font-size:12px;color:#b45309}
+.note{font-size:11px;color:#777;margin-top:14px;line-height:1.5}
+#ov{position:fixed;left:0;top:0;right:0;bottom:0;background:#f4f5f7;overflow:auto;display:none;z-index:10}
+#ov.on{display:block}
+.dh{position:sticky;top:0;background:#fff;padding:10px 12px;border-bottom:1px solid #ddd}
+.dh button{border:0;background:none;font-size:15px;color:#0b5cd5;padding:4px 0}
+.dc{padding:12px}
+.dc h2{font-size:20px;margin:0 0 2px} .dc .code{font-weight:400;color:#777;font-size:15px}
+.dc .sec{margin:0 0 8px}
+.big{display:flex;justify-content:space-between;align-items:baseline;font-size:22px;font-weight:700;margin-bottom:6px}
+.big .score{font-size:16px}
+.dc h3{font-size:14px;margin:18px 0 6px;color:#444}
+.ch{width:100%;height:auto;background:#fff;border-radius:8px}
+.cap{font-size:11px;color:#888;margin-top:2px}
+.bar{display:flex;align-items:center;gap:8px;font-size:13px;margin:6px 0}
+.bar span{width:84px;color:#555}.bar b{width:30px;text-align:right}
+.tr{flex:1;height:8px;background:#e3e6ea;border-radius:4px;overflow:hidden}
+.fl{height:100%;background:#0a7d33}
+table{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;font-size:14px}
+th{text-align:left;font-weight:400;color:#666;padding:8px 12px;border-bottom:1px solid #eee}
+td{text-align:right;font-weight:600;padding:8px 12px;border-bottom:1px solid #eee}
+.wn{background:#fff7ed;border-radius:8px;padding:8px 12px;margin:6px 0;font-size:13px;color:#9a3412}
+.lk{display:block;background:#fff;border-radius:8px;padding:12px;margin:6px 0;color:#0b5cd5;text-decoration:none;font-size:14px}
+</style></head><body>
+<h1>売られ過ぎ割安株スクリーニング</h1>
+<div class="meta">更新 __NOW__<br>__META__</div>
+<div id="list">__CARDS__</div>
+<div class="note">__NOTE__</div>
+<div id="ov"></div>
+<script type="application/json" id="d">__DATA__</script>
+<script>
+var D=JSON.parse(document.getElementById('d').textContent);
+var ov=document.getElementById('ov');
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+function chart(x){
+  var s=x.spark; if(!s||s.length<2) return '';
+  var base=(x.base==null)?s[0]:x.base;
+  var W=300,H=110,P=6,all=s.concat([base]);
+  var mn=Math.min.apply(null,all),mx=Math.max.apply(null,all);
+  if(mx===mn) mx=mn+1;
+  function X(k){return P+(W-2*P)*k/(s.length-1);}
+  function Y(v){return H-P-(H-2*P)*(v-mn)/(mx-mn);}
+  var pts=s.map(function(v,k){return X(k).toFixed(1)+','+Y(v).toFixed(1);}).join(' ');
+  var by=Y(base).toFixed(1);
+  return '<h3>今年の株価の推移</h3><svg viewBox="0 0 '+W+' '+H+'" class="ch">'
+   +'<line x1="'+P+'" x2="'+(W-P)+'" y1="'+by+'" y2="'+by+'" stroke="#999" stroke-dasharray="3 3"/>'
+   +'<polyline fill="none" stroke="#0b5cd5" stroke-width="2" points="'+pts+'"/></svg>'
+   +'<div class="cap">点線は年初の株価です</div>';
+}
+function render(i){
+  var x=D[i],h='';
+  h+='<div class="dh"><button id="bk">← 一覧に戻る</button></div><div class="dc">';
+  h+='<h2>'+esc(x.name)+' <span class="code">('+esc(x.code)+')</span></h2>';
+  h+='<div class="sec">'+esc(x.sector)+'</div>';
+  h+='<div class="big"><span>'+esc(x.price)+'</span><span class="score">スコア '+esc(x.score)+'</span></div>';
+  h+=chart(x);
+  h+='<h3>スコアの内訳(0〜100)</h3>';
+  x.bars.forEach(function(b){
+    h+='<div class="bar"><span>'+esc(b[0])+'</span><div class="tr"><div class="fl" style="width:'+Number(b[1])+'%"></div></div><b>'+esc(b[1])+'</b></div>';
+  });
+  h+='<h3>指標</h3><table>';
+  x.rows.forEach(function(r){h+='<tr><th>'+esc(r[0])+'</th><td>'+esc(r[1])+'</td></tr>';});
+  h+='</table>';
+  if(x.warns.length){
+    h+='<h3>注意点</h3>';
+    x.warns.forEach(function(w){h+='<div class="wn">⚠ <b>'+esc(w[0])+'</b> '+esc(w[1])+'</div>';});
+  }
+  h+='<h3>外部サイトで詳しく見る</h3>';
+  x.links.forEach(function(l){
+    h+='<a class="lk" target="_blank" rel="noopener" href="'+esc(l[1])+'">'+esc(l[0])+' ↗</a>';
+  });
+  h+='</div>';
+  ov.innerHTML=h; ov.scrollTop=0;
+  document.getElementById('bk').onclick=function(){history.back();};
+}
+function openDetail(i){
+  render(i); ov.classList.add('on'); document.body.style.overflow='hidden';
+  history.pushState({d:i},'','#'+i);
+}
+function closeDetail(){ov.classList.remove('on');document.body.style.overflow='';}
+window.addEventListener('popstate',closeDetail);
+document.getElementById('list').addEventListener('click',function(e){
+  var c=e.target.closest('.card'); if(c) openDetail(Number(c.getAttribute('data-i')));
+});
+</script>
+</body></html>"""
+
+
+def _pct(v):
+    return "-" if v is None or pd.isna(v) else f"{v * 100:.1f}%"
+
+
+def _num(v, nd=1):
+    return "-" if v is None or pd.isna(v) else f"{v:.{nd}f}"
+
+
+def _spark_list(r):
+    import json
+    s = r.get("spark") if hasattr(r, "get") else None
+    if isinstance(s, str):
+        try:
+            s = json.loads(s)
+        except Exception:
+            s = None
+    return s if isinstance(s, list) else []
+
+
+def build_detail(r):
+    """詳細画面用のデータ(表示用に整形済み)"""
+    code = str(r["ticker"]).replace(".T", "")
+    base = r.get("base_price")
+    warns = []
+    for w in str(r["warning"]).split(","):
+        if w in WARN_TEXT:
+            warns.append([w, WARN_TEXT[w]])
+    de = r.get("debt_to_equity")
+    return {
+        "name": str(r["name"]),
+        "code": code,
+        "sector": str(r["sector"]),
+        "score": f"{r['score']:.1f}",
+        "price": f"{r['price']:,.0f}円",
+        "base": None if base is None or pd.isna(base) else float(base),
+        "spark": _spark_list(r),
+        "bars": [
+            ["売られ過ぎ度", round(float(r["s_oversold"]) * 100)],
+            ["割安度", round(float(r["s_cheap"]) * 100)],
+            ["業績の質", round(float(r["s_quality"]) * 100)],
+        ],
+        "rows": [
+            ["今年の騰落", _pct(r["ytd_return"])],
+            ["今年の高値から", _pct(r["from_high"])],
+            ["RSI(14日)", _num(r["rsi14"])],
+            ["PER", _num(r["per"])],
+            ["PBR", _num(r["pbr"], 2)],
+            ["ROE", _pct(r["roe"])],
+            ["増益率", _pct(r["earnings_growth"])],
+            ["増収率", _pct(r["revenue_growth"])],
+            ["利益率", _pct(r["profit_margin"])],
+            ["負債資本比率", "-" if de is None or pd.isna(de) else f"{de:.0f}%"],
+        ],
+        "warns": warns,
+        "links": [
+            ["Yahoo!ファイナンス", f"https://finance.yahoo.co.jp/quote/{r['ticker']}"],
+            ["株探(かぶたん)", f"https://kabutan.jp/stock/?code={code}"],
+        ],
+    }
+
+
 def write_html(result, path, n_total, top=100):
     import html
+    import json
     import os
     from datetime import datetime, timedelta, timezone
     jst = timezone(timedelta(hours=9))
     now = datetime.now(jst).strftime("%Y-%m-%d %H:%M JST")
-
-    def pct(v):
-        return "-" if pd.isna(v) else f"{v * 100:.1f}%"
-
-    def num(v, nd=1):
-        return "-" if pd.isna(v) else f"{v:.{nd}f}"
 
     shown = min(top, len(result))
     if STATS:
@@ -332,58 +505,46 @@ def write_html(result, path, n_total, top=100):
                 f"→ 条件該当{len(result)}社(上位{shown}社を表示)")
         low = (STATS["priced"] < 0.8 * STATS["universe"]
                or STATS["fundamentals"] < 0.8 * max(STATS["dropped"], 1))
-        cov = ('<div class="warn">⚠ データ取得率が低く、一部の銘柄が'
-               '抜けています</div>' if low else "")
+        if low:
+            meta += ('<div class="warn">⚠ データ取得率が低く、一部の銘柄が'
+                     '抜けています</div>')
     else:
         meta = f"全{n_total}社中 条件該当 {len(result)}社(上位{shown}社を表示)"
-        cov = ""
 
-    cards = []
-    for i, (_, r) in enumerate(result.head(top).iterrows(), 1):
+    cards, details = [], []
+    for i, (_, r) in enumerate(result.head(top).iterrows()):
         code = str(r["ticker"]).replace(".T", "")
-        link = f"https://finance.yahoo.co.jp/quote/{r['ticker']}"
         warn = (f'<div class="warn">⚠ {html.escape(r["warning"])}</div>'
                 if r["warning"] else "")
         cards.append(f"""
-<div class="card">
-  <div class="head"><span class="rank">{i}</span>
-    <a href="{link}">{html.escape(str(r['name']))} ({html.escape(code)})</a>
+<div class="card" data-i="{i}">
+  <div class="head"><span class="rank">{i + 1}</span>
+    <span class="nm">{html.escape(str(r['name']))} ({html.escape(code)}) ›</span>
     <span class="score">{r['score']:.1f}</span></div>
   <div class="sec">{html.escape(str(r['sector']))}</div>
   <div class="grid">
-    <div>今年<b>{pct(r['ytd_return'])}</b></div>
-    <div>高値から<b>{pct(r['from_high'])}</b></div>
-    <div>PER<b>{num(r['per'])}</b></div>
-    <div>PBR<b>{num(r['pbr'], 2)}</b></div>
-    <div>ROE<b>{pct(r['roe'])}</b></div>
-    <div>増益率<b>{pct(r['earnings_growth'])}</b></div>
+    <div>今年<b>{_pct(r['ytd_return'])}</b></div>
+    <div>高値から<b>{_pct(r['from_high'])}</b></div>
+    <div>PER<b>{_num(r['per'])}</b></div>
+    <div>PBR<b>{_num(r['pbr'], 2)}</b></div>
+    <div>ROE<b>{_pct(r['roe'])}</b></div>
+    <div>増益率<b>{_pct(r['earnings_growth'])}</b></div>
   </div>{warn}
 </div>""")
+        details.append(build_detail(r))
 
-    page = f"""<!doctype html><html lang="ja"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>売られ過ぎ割安株スクリーニング</title>
-<style>
-body{{font-family:-apple-system,sans-serif;margin:0;padding:12px;background:#f4f5f7;color:#222}}
-h1{{font-size:18px;margin:4px 0}} .meta{{font-size:12px;color:#666;margin-bottom:10px;line-height:1.5}}
-.card{{background:#fff;border-radius:10px;padding:10px 12px;margin-bottom:8px;box-shadow:0 1px 2px #0002}}
-.head{{display:flex;gap:8px;align-items:center;font-size:15px}}
-.head a{{flex:1;color:#0b5cd5;text-decoration:none;font-weight:600}}
-.rank{{background:#222;color:#fff;border-radius:50%;min-width:22px;height:22px;text-align:center;font-size:12px;line-height:22px}}
-.score{{font-weight:700;color:#0a7d33}} .sec{{font-size:12px;color:#777;margin:2px 0 6px 30px}}
-.grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;font-size:12px;color:#555}}
-.grid b{{display:block;font-size:14px;color:#111}}
-.warn{{margin-top:6px;font-size:12px;color:#b45309}}
-.note{{font-size:11px;color:#777;margin-top:14px;line-height:1.5}}
-</style></head><body>
-<h1>売られ過ぎ割安株スクリーニング</h1>
-<div class="meta">更新 {now}<br>{meta}{cov}</div>
-{''.join(cards) if cards else '<p>条件に該当する銘柄はありませんでした。</p>'}
-<div class="note">スコアは「売られ過ぎ度30%・業種内の割安度35%・業績の質35%」の合成(0〜100)で、今年下落した銘柄どうしの相対評価です。
-⚠は減益・減収・高負債・低ROEなど、安い理由がある可能性のある銘柄です。
-株価は前営業日の終値までで、データはyfinance(Yahoo Finance)由来のため、遅延・欠損・誤りがあり得ます。
-投資助言ではありません。下落理由を決算資料やニュースで確認のうえ、ご自身で判断してください。</div>
-</body></html>"""
+    note = ("スコアは「売られ過ぎ度30%・業種内の割安度35%・業績の質35%」の合成"
+            "(0〜100)で、今年下落した銘柄どうしの相対評価です。"
+            "⚠は減益・減収・高負債・低ROEなど、安い理由がある可能性のある銘柄です。"
+            "株価は前営業日の終値までで、データはyfinance(Yahoo Finance)由来のため、"
+            "遅延・欠損・誤りがあり得ます。"
+            "投資助言ではありません。下落理由を決算資料やニュースで確認のうえ、"
+            "ご自身で判断してください。")
+    data = json.dumps(details, ensure_ascii=False).replace("</", "<\\/")
+    page = (PAGE.replace("__NOW__", now).replace("__META__", meta)
+            .replace("__CARDS__", ''.join(cards) if cards else
+                     "<p>条件に該当する銘柄はありませんでした。</p>")
+            .replace("__NOTE__", note).replace("__DATA__", data))
     d = os.path.dirname(path)
     if d:
         os.makedirs(d, exist_ok=True)
