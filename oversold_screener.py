@@ -5,23 +5,30 @@
 「今年の株価下落」×「セクター内での割安度(PER/PBR)」×「業績の質」を
 組み合わせて、"理由なく売られていそう"な銘柄をスコア順に抽出します。
 
+取得の流れ(Yahooのアクセス制限を避けるため2段階):
+  1) 全銘柄の株価をまとめて取得し、今年の下落率を計算
+  2) 今年下落した銘柄だけ、PER/PBR/ROEなどの業績データを取得
+
 使い方:
-  pip install yfinance pandas numpy
+  pip install yfinance pandas numpy openpyxl
+  python oversold_screener.py --all --html docs/index.html --out docs/result.csv
   python oversold_screener.py --tickers tickers.txt --top 20
   python oversold_screener.py --demo            # ネット不要の動作確認
-
-tickers.txt は1行1銘柄。日本株は 7203.T のように末尾に .T
-米国株は AAPL のようにそのまま。
 
 ※ 投資助言ではありません。スコアは候補の絞り込み用で、
   「下がっている理由」は必ず決算資料・ニュースで確認してください。
 """
 import argparse
+import random
 import sys
+import time
 from datetime import date
 
 import numpy as np
 import pandas as pd
+
+STATS = {}       # 取得件数の記録(HTMLに表示)
+COOLDOWN = 20    # 失敗した銘柄を再試行する前の待ち時間(秒)
 
 
 # ---------------------------------------------------------------- データ取得
@@ -34,36 +41,96 @@ def rsi(close: pd.Series, n: int = 14) -> float:
     return float(val.iloc[-1]) if len(val.dropna()) else np.nan
 
 
-def fetch_one(yf, ticker: str):
-    t = yf.Ticker(ticker)
-    start = f"{date.today().year - 1}-12-25"  # 年初基準を取るため少し前から
-    hist = t.history(start=start, auto_adjust=True)
-    if hist.empty:
+def price_metrics(close):
+    """終値の系列から、今年の下落率・高値からの下落・RSIを計算"""
+    if close is None:
         return None
-    close = hist["Close"]
-    this_year = close[close.index.year == date.today().year]
+    close = close.dropna()
+    if close.empty:
+        return None
+    year = date.today().year
+    this_year = close[close.index.year == year]
     if this_year.empty:
         return None
-    base = close[close.index.year < date.today().year]
-    base_price = base.iloc[-1] if len(base) else this_year.iloc[0]
-    info = t.info or {}
+    base = close[close.index.year < year]
+    base_price = float(base.iloc[-1]) if len(base) else float(this_year.iloc[0])
+    last = float(close.iloc[-1])
     return {
-        "ticker": ticker,
-        "name": info.get("shortName") or info.get("longName") or "",
-        "sector": info.get("sector") or "Unknown",
-        "price": float(close.iloc[-1]),
-        "ytd_return": float(close.iloc[-1] / base_price - 1),
-        "from_high": float(close.iloc[-1] / this_year.max() - 1),
+        "price": last,
+        "ytd_return": last / base_price - 1,
+        "from_high": last / float(this_year.max()) - 1,
         "rsi14": rsi(close),
-        "per": info.get("trailingPE"),
-        "pbr": info.get("priceToBook"),
-        "roe": info.get("returnOnEquity"),
-        "earnings_growth": info.get("earningsGrowth"),
-        "revenue_growth": info.get("revenueGrowth"),
-        "profit_margin": info.get("profitMargins"),
-        "debt_to_equity": info.get("debtToEquity"),  # %表記
-        "div_yield": info.get("dividendYield"),
     }
+
+
+def _extract_close(data, tk, single):
+    try:
+        if isinstance(data.columns, pd.MultiIndex):
+            if tk in data.columns.get_level_values(0):
+                return data[tk]["Close"]
+            return None
+        return data["Close"] if single else None
+    except Exception:
+        return None
+
+
+def fetch_prices(yf, tickers, chunk=100, retries=2):
+    """株価をまとめて取得(100銘柄ずつ)。失敗分は待ってから再試行"""
+    start = f"{date.today().year - 1}-12-20"
+    out, pending = {}, list(tickers)
+    for attempt in range(retries + 1):
+        failed = []
+        for i in range(0, len(pending), chunk):
+            part = pending[i:i + chunk]
+            try:
+                data = yf.download(part, start=start, auto_adjust=True,
+                                   group_by="ticker", progress=False,
+                                   threads=True)
+            except Exception as e:
+                print(f"株価取得エラー: {e}", file=sys.stderr)
+                failed += part
+                time.sleep(COOLDOWN)
+                continue
+            for tk in part:
+                m = price_metrics(_extract_close(data, tk, len(part) == 1))
+                if m:
+                    out[tk] = m
+                else:
+                    failed.append(tk)
+            print(f"株価 {min(i + chunk, len(pending))}/{len(pending)} "
+                  f"(累計取得 {len(out)})", file=sys.stderr)
+        pending = failed
+        if not pending:
+            break
+        if attempt < retries:
+            time.sleep(COOLDOWN)
+    return out
+
+
+def fetch_info(yf, tk, tries=4):
+    """業績データを取得。制限に当たったら待って再試行"""
+    for i in range(tries):
+        try:
+            info = yf.Ticker(tk).info or {}
+            if (info.get("trailingPE") is not None
+                    or info.get("priceToBook") is not None
+                    or info.get("shortName") or info.get("longName")):
+                return {
+                    "name": info.get("shortName") or info.get("longName") or "",
+                    "sector": info.get("sector") or "Unknown",
+                    "per": info.get("trailingPE"),
+                    "pbr": info.get("priceToBook"),
+                    "roe": info.get("returnOnEquity"),
+                    "earnings_growth": info.get("earningsGrowth"),
+                    "revenue_growth": info.get("revenueGrowth"),
+                    "profit_margin": info.get("profitMargins"),
+                    "debt_to_equity": info.get("debtToEquity"),  # %表記
+                    "div_yield": info.get("dividendYield"),
+                }
+        except Exception:
+            pass
+        time.sleep(min(2 * (2 ** i), COOLDOWN) + random.random())
+    return None
 
 
 JPX_URL = ("https://www.jpx.co.jp/markets/statistics-equities/misc/"
@@ -89,36 +156,65 @@ def _parse_jpx(df):
     return tickers, sectors, names
 
 
-def fetch_all(tickers, workers=8, sector_map=None, name_map=None):
-    try:
-        import yfinance as yf
-    except ImportError:
-        sys.exit("yfinance が必要です: pip install yfinance")
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+def fetch_all(tickers, workers=3, sector_map=None, name_map=None,
+              min_drop=0.10, max_minutes=240, yf=None):
+    if yf is None:
+        try:
+            import yfinance as yf
+        except ImportError:
+            sys.exit("yfinance が必要です: pip install yfinance")
+    from concurrent.futures import ThreadPoolExecutor
 
+    t0 = time.time()
+    workers = max(1, min(workers, 3))  # 多すぎるとYahooに制限される
+    STATS.clear()
+    STATS["universe"] = len(tickers)
+
+    # 1) 株価をまとめて取得 → 今年の下落率で絞る
+    prices = fetch_prices(yf, tickers)
+    dropped = [tk for tk, m in prices.items() if m["ytd_return"] <= -min_drop]
+    STATS["priced"] = len(prices)
+    STATS["dropped"] = len(dropped)
+    print(f"株価取得 {len(prices)}/{len(tickers)} 社、"
+          f"今年{min_drop:.0%}以上下落 {len(dropped)} 社", file=sys.stderr)
+
+    # 2) 下落した銘柄だけ業績データを取得(失敗分は最大3周)
     def job(tk):
-        for attempt in range(2):  # 1回だけ再試行
-            try:
-                return fetch_one(yf, tk)
-            except Exception:
-                if attempt == 1:
-                    return None
+        if time.time() - t0 > max_minutes * 60:
+            return tk, None
+        r = fetch_info(yf, tk)
+        time.sleep(0.3)
+        return tk, r
 
-    rows, done = [], 0
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(job, tk): tk for tk in tickers}
-        for fu in as_completed(futs):
-            done += 1
-            r = fu.result()
-            if r:
-                if sector_map and futs[fu] in sector_map:
-                    r["sector"] = sector_map[futs[fu]]  # 33業種で比較
-                if name_map and futs[fu] in name_map:
-                    r["name"] = name_map[futs[fu]]  # 日本語の会社名
-                rows.append(r)
-            if done % 100 == 0 or done == len(tickers):
-                print(f"{done}/{len(tickers)} 完了(取得成功 {len(rows)})",
-                      file=sys.stderr)
+    infos, pending = {}, list(dropped)
+    for rnd in range(3):
+        if not pending or time.time() - t0 > max_minutes * 60:
+            break
+        done = 0
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for tk, r in ex.map(job, pending):
+                done += 1
+                if r:
+                    infos[tk] = r
+                if done % 100 == 0:
+                    print(f"業績 {done}/{len(pending)} (累計取得 {len(infos)})",
+                          file=sys.stderr)
+        pending = [tk for tk in pending if tk not in infos]
+        if pending and rnd < 2:
+            time.sleep(COOLDOWN * 3)
+
+    rows = []
+    for tk in dropped:
+        if tk not in infos:
+            continue
+        row = {"ticker": tk, **prices[tk], **infos[tk]}
+        if sector_map and sector_map.get(tk):
+            row["sector"] = sector_map[tk]  # 33業種で比較
+        if name_map and name_map.get(tk):
+            row["name"] = name_map[tk]      # 日本語の会社名
+        rows.append(row)
+    STATS["fundamentals"] = len(rows)
+    print(f"業績取得 {len(rows)}/{len(dropped)} 社", file=sys.stderr)
     return pd.DataFrame(rows)
 
 
@@ -229,6 +325,19 @@ def write_html(result, path, n_total, top=100):
     def num(v, nd=1):
         return "-" if pd.isna(v) else f"{v:.{nd}f}"
 
+    shown = min(top, len(result))
+    if STATS:
+        meta = (f"対象{STATS['universe']}社 → 株価取得{STATS['priced']}社 → "
+                f"今年下落{STATS['dropped']}社 → 業績取得{STATS['fundamentals']}社 "
+                f"→ 条件該当{len(result)}社(上位{shown}社を表示)")
+        low = (STATS["priced"] < 0.8 * STATS["universe"]
+               or STATS["fundamentals"] < 0.8 * max(STATS["dropped"], 1))
+        cov = ('<div class="warn">⚠ データ取得率が低く、一部の銘柄が'
+               '抜けています</div>' if low else "")
+    else:
+        meta = f"全{n_total}社中 条件該当 {len(result)}社(上位{shown}社を表示)"
+        cov = ""
+
     cards = []
     for i, (_, r) in enumerate(result.head(top).iterrows(), 1):
         code = str(r["ticker"]).replace(".T", "")
@@ -256,7 +365,7 @@ def write_html(result, path, n_total, top=100):
 <title>売られ過ぎ割安株スクリーニング</title>
 <style>
 body{{font-family:-apple-system,sans-serif;margin:0;padding:12px;background:#f4f5f7;color:#222}}
-h1{{font-size:18px;margin:4px 0}} .meta{{font-size:12px;color:#666;margin-bottom:10px}}
+h1{{font-size:18px;margin:4px 0}} .meta{{font-size:12px;color:#666;margin-bottom:10px;line-height:1.5}}
 .card{{background:#fff;border-radius:10px;padding:10px 12px;margin-bottom:8px;box-shadow:0 1px 2px #0002}}
 .head{{display:flex;gap:8px;align-items:center;font-size:15px}}
 .head a{{flex:1;color:#0b5cd5;text-decoration:none;font-weight:600}}
@@ -268,11 +377,11 @@ h1{{font-size:18px;margin:4px 0}} .meta{{font-size:12px;color:#666;margin-bottom
 .note{{font-size:11px;color:#777;margin-top:14px;line-height:1.5}}
 </style></head><body>
 <h1>売られ過ぎ割安株スクリーニング</h1>
-<div class="meta">更新 {now} ／ 全{n_total}社中 条件該当 {len(result)}社(上位{min(top, len(result))}社を表示)</div>
+<div class="meta">更新 {now}<br>{meta}{cov}</div>
 {''.join(cards) if cards else '<p>条件に該当する銘柄はありませんでした。</p>'}
-<div class="note">スコアは「売られ過ぎ度30%・業種内の割安度35%・業績の質35%」の合成(0〜100)。
+<div class="note">スコアは「売られ過ぎ度30%・業種内の割安度35%・業績の質35%」の合成(0〜100)で、今年下落した銘柄どうしの相対評価です。
 ⚠は減益・減収・高負債・低ROEなど、安い理由がある可能性のある銘柄です。
-データはyfinance(Yahoo Finance)由来で、遅延・欠損・誤りがあり得ます。
+株価は前営業日の終値までで、データはyfinance(Yahoo Finance)由来のため、遅延・欠損・誤りがあり得ます。
 投資助言ではありません。下落理由を決算資料やニュースで確認のうえ、ご自身で判断してください。</div>
 </body></html>"""
     d = os.path.dirname(path)
@@ -298,7 +407,9 @@ def main():
     ap.add_argument("--all", action="store_true",
                     help="JPX公式一覧から東証など全上場の内国株を対象にする")
     ap.add_argument("--jpx-file", help="手動保存した data_j.xlsx のパス")
-    ap.add_argument("--workers", type=int, default=8, help="並列数")
+    ap.add_argument("--workers", type=int, default=3, help="並列数(最大3)")
+    ap.add_argument("--max-minutes", type=int, default=240,
+                    help="業績取得に使う時間の上限(分)")
     ap.add_argument("--cache", default="raw_cache.csv",
                     help="取得データの保存先(再実行時に再利用)")
     ap.add_argument("--use-cache", action="store_true",
@@ -316,13 +427,15 @@ def main():
             tks, smap, nmap = _parse_jpx(pd.read_excel(args.jpx_file))
         else:
             tks, smap, nmap = load_jpx_all()
-        print(f"対象 {len(tks)} 銘柄。全件取得には数十分かかります", file=sys.stderr)
-        raw = fetch_all(tks, args.workers, smap, nmap)
+        print(f"対象 {len(tks)} 銘柄", file=sys.stderr)
+        raw = fetch_all(tks, args.workers, smap, nmap,
+                        args.min_drop, args.max_minutes)
         raw.to_csv(args.cache, index=False, encoding="utf-8-sig")
     elif args.tickers:
         with open(args.tickers, encoding="utf-8") as f:
             tks = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-        raw = fetch_all(tks, args.workers)
+        raw = fetch_all(tks, args.workers, None, None,
+                        args.min_drop, args.max_minutes)
         raw.to_csv(args.cache, index=False, encoding="utf-8-sig")
     else:
         ap.error("--all, --tickers, --demo のいずれかを指定してください")
@@ -349,7 +462,9 @@ def main():
     show["score"] = show["score"].round(1)
     with pd.option_context("display.width", 200, "display.max_columns", 20):
         print(show.to_string(index=False))
-    print(f"\n候補 {len(result)} 件 / 全体 {len(raw)} 件 → {args.out} に保存")
+    print(f"\n候補 {len(result)} 件 / 業績取得 {len(raw)} 件 → {args.out} に保存")
+    if STATS:
+        print(f"取得状況: {STATS}")
     print("※ 下落率・ROE・増益率の単位は%。warning欄の銘柄は下落理由を要確認。")
 
 
