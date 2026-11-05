@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install
-        run: pip install yfinance pandas numpy xlrd openpyxl
+        run: pip install yfinance pandas numpy xlrd openpyxl && mkdir -p docs
       - name: Screen all listed companies
         run: >
           python oversold_screener.py --all --workers 4 --top 50
