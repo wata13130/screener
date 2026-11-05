@@ -132,12 +132,29 @@ def fetch_info(yf, tk, tries=4):
                     "revenue_growth": info.get("revenueGrowth"),
                     "profit_margin": info.get("profitMargins"),
                     "debt_to_equity": info.get("debtToEquity"),  # %表記
-                    "div_yield": info.get("dividendYield"),
+                    "dividend_rate": info.get("dividendRate"),   # 年間配当(円)
+                    "div_yield_trailing": info.get("trailingAnnualDividendYield"),
+                    "payout_ratio": info.get("payoutRatio"),     # 配当性向
                 }
         except Exception:
             pass
         time.sleep(min(2 * (2 ** i), COOLDOWN) + random.random())
     return None
+
+
+def _div_yield(row):
+    """配当利回り(0.025=2.5%)。年間配当÷株価で計算し、無ければ直近実績を使う"""
+    rate, price = row.get("dividend_rate"), row.get("price")
+    try:
+        if rate and price and float(rate) > 0:
+            return float(rate) / float(price)
+    except (TypeError, ValueError):
+        pass
+    y = row.get("div_yield_trailing")
+    try:
+        return float(y) if y is not None and float(y) > 0 else None
+    except (TypeError, ValueError):
+        return None
 
 
 JPX_URL = ("https://www.jpx.co.jp/markets/statistics-equities/misc/"
@@ -215,6 +232,7 @@ def fetch_all(tickers, workers=3, sector_map=None, name_map=None,
         if tk not in infos:
             continue
         row = {"ticker": tk, **prices[tk], **infos[tk]}
+        row["div_yield"] = _div_yield(row)
         if sector_map and sector_map.get(tk):
             row["sector"] = sector_map[tk]  # 33業種で比較
         if name_map and name_map.get(tk):
@@ -245,6 +263,7 @@ def demo_data(n=80, seed=0):
         "profit_margin": rng.uniform(0.01, 0.25, n),
         "debt_to_equity": rng.uniform(5, 200, n),
         "div_yield": rng.uniform(0, 0.05, n),
+        "payout_ratio": rng.uniform(0, 1.2, n),
     })
 
 
@@ -480,6 +499,8 @@ def build_detail(r):
             ["増益率", _pct(r["earnings_growth"])],
             ["増収率", _pct(r["revenue_growth"])],
             ["利益率", _pct(r["profit_margin"])],
+            ["配当利回り", _pct(r.get("div_yield"))],
+            ["配当性向", _pct(r.get("payout_ratio"))],
             ["負債資本比率", "-" if de is None or pd.isna(de) else f"{de:.0f}%"],
         ],
         "warns": warns,
@@ -529,6 +550,8 @@ def write_html(result, path, n_total, top=100):
     <div>PBR<b>{_num(r['pbr'], 2)}</b></div>
     <div>ROE<b>{_pct(r['roe'])}</b></div>
     <div>増益率<b>{_pct(r['earnings_growth'])}</b></div>
+    <div>配当利回り<b>{_pct(r.get('div_yield'))}</b></div>
+    <div>配当性向<b>{_pct(r.get('payout_ratio'))}</b></div>
   </div>{warn}
 </div>""")
         details.append(build_detail(r))
