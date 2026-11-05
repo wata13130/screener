@@ -72,13 +72,12 @@ JPX_URL = ("https://www.jpx.co.jp/markets/statistics-equities/misc/"
 
 def load_jpx_all():
     """JPX公式の上場銘柄一覧から、内国株式(ETF・REIT等を除く)を全件取得。
-    戻り値: (ティッカー一覧, {ティッカー: 33業種区分})"""
+    戻り値: (ティッカー一覧, {ティッカー: 33業種区分}, {ティッカー: 会社名})"""
     try:
-        df = pd.read_excel(JPX_URL)  # xlrd が必要: pip install xlrd
+        df = pd.read_excel(JPX_URL)  # openpyxl が必要: pip install openpyxl
     except Exception as e:
         sys.exit(f"JPX銘柄一覧を取得できませんでした: {e}\n"
-                 "pip install xlrd xlwt を試すか、data_j.xls を手動で保存して "
-                 "--jpx-file で指定してください")
+                 "data_j.xlsx を手動で保存して --jpx-file で指定してください")
     return _parse_jpx(df)
 
 
@@ -86,10 +85,11 @@ def _parse_jpx(df):
     df = df[df["市場・商品区分"].astype(str).str.contains("内国株式")]
     tickers = [f"{str(c).strip()}.T" for c in df["コード"]]
     sectors = dict(zip(tickers, df["33業種区分"].astype(str)))
-    return tickers, sectors
+    names = dict(zip(tickers, df["銘柄名"].astype(str)))
+    return tickers, sectors, names
 
 
-def fetch_all(tickers, workers=8, sector_map=None):
+def fetch_all(tickers, workers=8, sector_map=None, name_map=None):
     try:
         import yfinance as yf
     except ImportError:
@@ -113,6 +113,8 @@ def fetch_all(tickers, workers=8, sector_map=None):
             if r:
                 if sector_map and futs[fu] in sector_map:
                     r["sector"] = sector_map[futs[fu]]  # 33業種で比較
+                if name_map and futs[fu] in name_map:
+                    r["name"] = name_map[futs[fu]]  # 日本語の会社名
                 rows.append(r)
             if done % 100 == 0 or done == len(tickers):
                 print(f"{done}/{len(tickers)} 完了(取得成功 {len(rows)})",
@@ -295,7 +297,7 @@ def main():
     ap.add_argument("--out", default="screening_result.csv")
     ap.add_argument("--all", action="store_true",
                     help="JPX公式一覧から東証など全上場の内国株を対象にする")
-    ap.add_argument("--jpx-file", help="手動保存した data_j.xls のパス")
+    ap.add_argument("--jpx-file", help="手動保存した data_j.xlsx のパス")
     ap.add_argument("--workers", type=int, default=8, help="並列数")
     ap.add_argument("--cache", default="raw_cache.csv",
                     help="取得データの保存先(再実行時に再利用)")
@@ -311,11 +313,11 @@ def main():
         raw = pd.read_csv(args.cache)
     elif args.all or args.jpx_file:
         if args.jpx_file:
-            tks, smap = _parse_jpx(pd.read_excel(args.jpx_file))
+            tks, smap, nmap = _parse_jpx(pd.read_excel(args.jpx_file))
         else:
-            tks, smap = load_jpx_all()
+            tks, smap, nmap = load_jpx_all()
         print(f"対象 {len(tks)} 銘柄。全件取得には数十分かかります", file=sys.stderr)
-        raw = fetch_all(tks, args.workers, smap)
+        raw = fetch_all(tks, args.workers, smap, nmap)
         raw.to_csv(args.cache, index=False, encoding="utf-8-sig")
     elif args.tickers:
         with open(args.tickers, encoding="utf-8") as f:
@@ -330,6 +332,9 @@ def main():
 
     scored = score(raw)
     result = apply_filters(scored, args)
+    out_dir = os.path.dirname(args.out)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     result.to_csv(args.out, index=False, encoding="utf-8-sig")
     if args.html:
         write_html(result, args.html, len(raw), top=max(args.top, 50))
